@@ -155,3 +155,28 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic Idempotency via Conditional UPDATE
+
+- **Decision:** In `POST /api/bills/:billId/shares/:shareId/pay`, payments are executed via an atomic conditional SQL statement: `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL`.
+- **Why:** In concurrent serverless environments, separate read-then-write checks allow race conditions (TOCTOU) where two simultaneous payment requests could both register as successful. The conditional `UPDATE` guarantees that exactly one transaction succeeds. By inspecting `meta.changes`, if `changes === 0`, we check the recorded `idempotency_key`: if identical, we return `200` with the existing payment; if different, we return `409 Conflict`.
+
+### 2. Deterministic Member Join Order via `rowid`
+
+- **Decision:** Member ordering in both bill splitting (`POST /api/homes/:homeId/bills`) and balances (`GET /api/homes/:homeId/balances`) is ordered by SQLite's internal `rowid ASC`.
+- **Why:** The specification mandates that remainder cents from uneven splits must be allocated one-by-one to members in the exact order they joined. When automated scripts or tests insert multiple members in quick succession, millisecond timestamps can collide. Sorting by SQLite's autoincrementing `rowid` guarantees insertion-order determinism without extra indexing or sequencing overhead.
+
+### 3. Atomic Batch Inserts and Correlated Balance Aggregation
+
+- **Decision:** Bill creation and share distribution are executed atomically using Cloudflare D1's `db.batch()`. Outstanding balances are calculated using a single correlated subquery filtering on `bills.home_id = m.home_id AND shares.paid_at IS NULL`.
+- **Why:** `db.batch()` ensures that a bill and its split shares are either committed together or rolled back completely if any constraint is violated. The correlated subquery prevents N+1 query loops, returns `$0` for settled members via `COALESCE`, and isolates balance calculations strictly to the home's own bills while preserving member order.
+
+### Database Constraints Summary
+
+Our schema in `api/migrations/0001_init.sql` includes named constraints to protect data integrity:
+1. `fk_members_home` (`FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE`): Prevents orphaned member records if a home is deleted or references an invalid home.
+2. `chk_bills_total_cents` (`CHECK (total_cents > 0)`): Guarantees that bills can only be created with strictly positive integer values in cents.
+3. `chk_shares_amount_cents` (`CHECK (amount_cents > 0)`): Ensures no share can have zero or negative value.
+4. `uq_shares_idempotency_key` (`UNIQUE (idempotency_key)`): Guarantees that an idempotency key cannot be accidentally applied across multiple different shares.
